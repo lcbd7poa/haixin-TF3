@@ -1,4 +1,4 @@
-name: 展讯UMS312完整签名(纯Python自包含版)
+name: 展讯UMS312简化签名(仅DHTB头)
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
         description: '输出文件名（不含扩展名）'
         required: false
         type: string
-        default: 'boot_signed_final'
+        default: 'boot_signed_simple'
 
 jobs:
   sign:
@@ -26,242 +26,7 @@ jobs:
       - name: 安装依赖
         run: |
           sudo apt update
-          sudo apt install -y python3 python3-cryptography python3-requests wget openssl
-
-      - name: 创建完整签名工具（纯Python实现AVB + DHTB）
-        run: |
-          cat > spd_full_signer.py << 'EOF'
-          #!/usr/bin/env python3
-          """
-          展讯/Unisoc (SPD) 完整签名工具
-          包含: AVB Hash Footer + DHTB Legacy Header (0x200)
-          不依赖任何外部工具，纯Python实现
-          """
-          
-          import os
-          import sys
-          import struct
-          import hashlib
-          import subprocess
-          import tempfile
-          from cryptography.hazmat.primitives import hashes, serialization
-          from cryptography.hazmat.primitives.asymmetric import padding, rsa
-          from cryptography.hazmat.backends import default_backend
-          
-          # 常量定义
-          DHTB_MAGIC = 0x200
-          DHTB_HEADER_SIZE = 32
-          AVB_FOOTER_SIZE = 64
-          AVB_MAGIC = b'AVBf'
-          AVB_VERSION = b'1.0'
-          AVB_HASH_TREE_DESCRIPTOR_TAG = 2
-          
-          class SPDCompleteSigner:
-              def __init__(self):
-                  self.backend = default_backend()
-              
-              def generate_rsa_key(self, key_path='rsa_key.pem'):
-                  """生成 RSA2048 密钥对"""
-                  if os.path.exists(key_path):
-                      with open(key_path, 'rb') as f:
-                          return serialization.load_pem_private_key(f.read(), password=None, backend=self.backend)
-                  
-                  print("[密钥] 生成 RSA2048 密钥对...")
-                  private_key = rsa.generate_private_key(
-                      public_exponent=65537,
-                      key_size=2048,
-                      backend=self.backend
-                  )
-                  
-                  # 保存私钥
-                  with open(key_path, 'wb') as f:
-                      f.write(private_key.private_bytes(
-                          encoding=serialization.Encoding.PEM,
-                          format=serialization.PrivateFormat.PKCS8,
-                          encryption_algorithm=serialization.NoEncryption()
-                      ))
-                  
-                  return private_key
-              
-              def calculate_avb_footer(self, image_data, partition_name='boot', private_key=None):
-                  """计算并生成 AVB footer"""
-                  image_size = len(image_data)
-                  
-                  # 计算哈希
-                  sha256 = hashlib.sha256(image_data).digest()
-                  
-                  # 签名
-                  if private_key:
-                      signature = private_key.sign(
-                          sha256,
-                          padding.PKCS1v15(),
-                          hashes.SHA256()
-                      )
-                  else:
-                      signature = b'\x00' * 256  # 空签名用于测试
-                  
-                  # 构建 AVB footer
-                  # 参考: https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avb_footer.h
-                  footer = bytearray(AVB_FOOTER_SIZE)
-                  
-                  # Magic (4 bytes)
-                  footer[0:4] = AVB_MAGIC
-                  
-                  # Version (4 bytes)
-                  footer[4:8] = AVB_VERSION
-                  
-                  # Original image size (8 bytes)
-                  struct.pack_into('<Q', footer, 8, image_size)
-                  
-                  # 存储签名和哈希（简化版，实际需要更多字段）
-                  footer[32:32+32] = sha256
-                  footer[64:64+len(signature)] = signature[:256] if len(signature) >= 256 else signature + b'\x00'*(256-len(signature))
-                  
-                  return bytes(footer)
-              
-              def add_avb_footer_simple(self, input_file, output_file, private_key=None):
-                  """简单版：添加 AVB footer 到镜像末尾"""
-                  with open(input_file, 'rb') as f:
-                      image_data = f.read()
-                  
-                  footer = self.calculate_avb_footer(image_data, 'boot', private_key)
-                  
-                  with open(output_file, 'wb') as f:
-                      f.write(image_data)
-                      f.write(footer)
-                  
-                  print(f"[AVB] 已添加 AVB footer ({len(footer)} 字节)")
-                  return output_file
-              
-              def insert_dhtb_header(self, input_file, output_file):
-                  """插入展讯 DHTB Legacy 头 (0x200)"""
-                  with open(input_file, 'rb') as f:
-                      image_data = f.read()
-                  
-                  image_size = len(image_data)
-                  
-                  # DHTB 头格式: magic(4) + size(4) + reserved(24)
-                  header = struct.pack('<I', DHTB_MAGIC)
-                  header += struct.pack('<I', image_size)
-                  header += b'\x00' * 24
-                  
-                  with open(output_file, 'wb') as f:
-                      f.write(header)
-                      f.write(image_data)
-                  
-                  print(f"[DHTB] 已插入 Legacy 头 (0x{DHTB_MAGIC:03x})")
-                  print(f"       头大小: {DHTB_HEADER_SIZE} 字节")
-                  print(f"       镜像大小: {image_size} 字节")
-                  print(f"       总大小: {DHTB_HEADER_SIZE + image_size} 字节")
-                  
-                  return output_file
-              
-              def sign_complete(self, input_file, output_file, partition_name='boot'):
-                  """完整签名流程"""
-                  print(f"\n=== 展讯 UMS312 完整签名 ===")
-                  print(f"输入: {input_file}")
-                  print(f"输出: {output_file}")
-                  print(f"分区: {partition_name}")
-                  print()
-                  
-                  # 生成密钥
-                  private_key = self.generate_rsa_key()
-                  
-                  # 创建临时文件
-                  with tempfile.NamedTemporaryFile(suffix='.img', delete=False) as tmp:
-                      tmp_avb = tmp.name
-                  
-                  try:
-                      # 步骤1: 添加 AVB footer
-                      self.add_avb_footer_simple(input_file, tmp_avb, private_key)
-                      
-                      # 步骤2: 插入 DHTB header
-                      self.insert_dhtb_header(tmp_avb, output_file)
-                      
-                      print(f"\n=== 签名完成 ===")
-                      print(f"最终文件: {output_file}")
-                      print(f"文件大小: {os.path.getsize(output_file)} 字节")
-                      
-                      # 验证
-                      self.verify_signature(output_file)
-                      
-                  finally:
-                      if os.path.exists(tmp_avb):
-                          os.remove(tmp_avb)
-                  
-                  return output_file
-              
-              def verify_signature(self, file_path):
-                  """验证签名"""
-                  with open(file_path, 'rb') as f:
-                      header = f.read(DHTB_HEADER_SIZE)
-                  
-                  if len(header) >= 4:
-                      magic = struct.unpack('<I', header[:4])[0]
-                      if magic == DHTB_MAGIC:
-                          print(f"\n[验证] DHTB 头验证通过 ✓ (0x{magic:03x})")
-                          
-                          # 读取镜像大小
-                          if len(header) >= 8:
-                              img_size = struct.unpack('<I', header[4:8])[0]
-                              print(f"[验证] 镜像大小: {img_size} 字节")
-                          return True
-                      else:
-                          print(f"\n[验证] DHTB 头验证失败: magic=0x{magic:03x}, 期望=0x{DHTB_MAGIC:03x}")
-                          return False
-                  return False
-              
-              def extract_boot_for_apatch(self, signed_file, output_file):
-                  """提取用于 Apatch 的 boot 镜像（移除 DHTB 头）"""
-                  with open(signed_file, 'rb') as f:
-                      header = f.read(DHTB_HEADER_SIZE)
-                      
-                      # 检查 DHTB 头
-                      magic = struct.unpack('<I', header[:4])[0]
-                      if magic == DHTB_MAGIC:
-                          img_size = struct.unpack('<I', header[4:8])[0]
-                          boot_data = f.read(img_size)
-                          
-                          with open(output_file, 'wb') as out:
-                              out.write(boot_data)
-                          
-                          print(f"[提取] 已提取原始 boot 镜像: {output_file}")
-                          print(f"       大小: {len(boot_data)} 字节")
-                          return output_file
-                  return None
-          
-          def main():
-              if len(sys.argv) < 3:
-                  print("用法:")
-                  print("  python3 spd_full_signer.py <input_img> <output_img> [partition_name]")
-                  print()
-                  print("示例:")
-                  print("  python3 spd_full_signer.py boot.img boot_signed.img boot")
-                  print("  python3 spd_full_signer.py --extract signed_boot.img extracted_boot.img")
-                  sys.exit(1)
-              
-              if sys.argv[1] == '--extract' and len(sys.argv) == 4:
-                  signer = SPDCompleteSigner()
-                  signer.extract_boot_for_apatch(sys.argv[2], sys.argv[3])
-                  return
-              
-              input_file = sys.argv[1]
-              output_file = sys.argv[2]
-              partition = sys.argv[3] if len(sys.argv) > 3 else 'boot'
-              
-              if not os.path.exists(input_file):
-                  print(f"错误: 输入文件不存在: {input_file}")
-                  sys.exit(1)
-              
-              signer = SPDCompleteSigner()
-              signer.sign_complete(input_file, output_file, partition)
-          
-          if __name__ == "__main__":
-              main()
-          EOF
-          
-          chmod +x spd_full_signer.py
-          echo "完整签名工具已创建"
+          sudo apt install -y wget
 
       - name: 下载 boot 镜像
         run: |
@@ -273,30 +38,60 @@ jobs:
           FILE_SIZE=$(stat -c%s original_boot.img)
           echo "下载完成，文件大小: $FILE_SIZE 字节"
           
-          # 检查文件类型
-          file original_boot.img || true
-          
-          # 显示文件头（调试）
-          echo "文件头 (前64字节):"
-          xxd original_boot.img | head -4
+          # 显示文件头
+          echo "文件头 (前32字节):"
+          xxd original_boot.img | head -2
 
-      - name: 执行展讯 Legacy 签名
+      - name: 简化签名（仅 DHTB 头，不加 AVB）
         run: |
-          INPUT_IMG="original_boot.img"
-          OUTPUT_IMG="${{ github.event.inputs.filename }}.img"
+          python3 << 'PYTHON_SCRIPT'
+          import struct
           
-          echo "开始签名流程..."
-          python3 spd_full_signer.py "$INPUT_IMG" "$OUTPUT_IMG" boot
+          # 读取原始 boot 镜像
+          with open('original_boot.img', 'rb') as f:
+              data = f.read()
           
-          # 显示最终文件信息
+          original_size = len(data)
+          print(f"原始文件大小: {original_size} 字节")
+          
+          # 构建 DHTB 头 (32字节)
+          # 格式: magic(0x200) + image_size + padding(24字节)
+          header = struct.pack('<II', 0x200, original_size)
+          header += b'\x00' * 24  # 保留字段，全0
+          
+          # 写入签名后的文件
+          output_file = '${{ github.event.inputs.filename }}.img'
+          with open(output_file, 'wb') as f:
+              f.write(header)
+              f.write(data)
+          
+          final_size = len(header) + len(data)
+          print(f"\n=== 签名完成 ===")
+          print(f"DHTB 头大小: {len(header)} 字节")
+          print(f"镜像大小: {original_size} 字节")
+          print(f"最终大小: {final_size} 字节")
+          print(f"输出文件: {output_file}")
+          
+          # 验证 DHTB 头
+          with open(output_file, 'rb') as f:
+              header_check = f.read(32)
+              magic = struct.unpack('<I', header_check[:4])[0]
+              size = struct.unpack('<I', header_check[4:8])[0]
+          
+          print(f"\n=== 验证结果 ===")
+          print(f"Magic: 0x{magic:03x} ({'✓' if magic == 0x200 else '✗'})")
+          print(f"镜像大小: {size} 字节 ({'✓' if size == original_size else '✗'})")
+          PYTHON_SCRIPT
+
+      - name: 显示最终文件信息
+        run: |
           echo ""
           echo "=== 最终输出 ==="
-          ls -lh "$OUTPUT_IMG"
+          ls -lh ${{ github.event.inputs.filename }}.img
           
-          # 显示 DHTB 头验证
           echo ""
-          echo "=== DHTB 头验证 (前32字节) ==="
-          xxd "$OUTPUT_IMG" | head -3
+          echo "=== DHTB 头详情 (前32字节) ==="
+          xxd ${{ github.event.inputs.filename }}.img | head -3
 
       - name: 上传签好的 boot
         uses: actions/upload-artifact@v4
