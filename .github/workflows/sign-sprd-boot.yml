@@ -1,1 +1,72 @@
 
+name: 展讯UMS312完整签名(支持URL下载)
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot_url:
+        description: 'boot镜像的直接下载链接（直链）'
+        required: true
+        type: string
+        default: 'https://example.com/your_boot.img'
+      filename:
+        description: '输出文件名（不含扩展名）'
+        required: false
+        type: string
+        default: 'boot_signed_final'
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: |
+          sudo apt update
+          sudo apt install -y python3 python3-cryptography gcc git wget
+          
+          # 克隆 AVB 工具
+          git clone https://github.com/android/platform-external_avb avb
+          
+          # 克隆展讯工具并编译 imgheaderinsert
+          git clone https://github.com/affggh/sprd-tools.git sprd
+          cd sprd/imgheaderinsert
+          gcc -o imgheaderinsert imgheaderinsert.c
+          sudo cp imgheaderinsert /usr/bin
+          cd ../..
+
+      - name: 下载 boot 镜像
+        run: |
+          echo "正在从 URL 下载: ${{ github.event.inputs.boot_url }}"
+          wget -O original_boot.img "${{ github.event.inputs.boot_url }}"
+          
+          # 显示文件大小，确认下载完整
+          ls -lh original_boot.img
+          echo "下载完成，文件大小: $(stat -c%s original_boot.img) 字节"
+
+      - name: 完整签名 boot（不截断）
+        run: |
+          INPUT=original_boot.img
+          OUTPUT_SIGNED="${{ github.event.inputs.filename }}.img"
+          
+          echo "开始 AVB 签名..."
+          python3 avb/avbtool.py add_hash_footer \
+            --image $INPUT \
+            --partition_name boot \
+            --algorithm SHA256_RSA2048 \
+            --key avb/test/data/rsa2048.pem \
+            --output boot_signed_avb.img
+          
+          echo "插入展讯 Legacy 头 (0x200)..."
+          imgheaderinsert boot_signed_avb.img "$OUTPUT_SIGNED" 0x200
+          
+          echo "签名完成！最终文件: $OUTPUT_SIGNED"
+          ls -lh "$OUTPUT_SIGNED"
+
+      - name: 上传签好的 boot
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.filename }}
+          path: ${{ github.event.inputs.filename }}.img
+          retention-days: 7
