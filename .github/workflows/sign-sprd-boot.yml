@@ -1,101 +1,51 @@
-name: 展讯UMS312简化签名(仅DHTB头)
+name: 展讯UMS312 正确签名工具 (Apatch/KernelSU)
 
 on:
   workflow_dispatch:
     inputs:
       boot_url:
-        description: 'boot镜像的直接下载链接（直链）'
+        description: "修补好的 boot 下载链接"
         required: true
         type: string
-        default: 'https://example.com/your_boot.img'
-      filename:
-        description: '输出文件名（不含扩展名）'
-        required: false
-        type: string
-        default: 'boot_signed_simple'
 
 jobs:
   sign:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    
     steps:
-      - uses: actions/checkout@v4
-
       - name: 安装依赖
         run: |
           sudo apt update
-          sudo apt install -y wget
+          sudo apt install -y python3 python3-pip gcc wget
+          pip3 install pycryptodome
 
-      - name: 下载 boot 镜像
+      - name: 下载 avbtool + 密钥
         run: |
-          echo "正在从 URL 下载: ${{ github.event.inputs.boot_url }}"
-          wget -O original_boot.img "${{ github.event.inputs.boot_url }}"
-          
-          # 显示文件信息
-          ls -lh original_boot.img
-          FILE_SIZE=$(stat -c%s original_boot.img)
-          echo "下载完成，文件大小: $FILE_SIZE 字节"
-          
-          # 显示文件头
-          echo "文件头 (前32字节):"
-          xxd original_boot.img | head -2
+          wget -O avbtool.py https://ghproxy.com/https://raw.githubusercontent.com/android/platform/external_avb/master/avbtool.py
+          wget -O rsa2048.pem https://ghproxy.com/https://raw.githubusercontent.com/android/platform/external_avb/master/test/data/rsa2048.pem
 
-      - name: 简化签名（仅 DHTB 头，不加 AVB）
+      - name: 下载展讯DHTB工具
         run: |
-          python3 << 'PYTHON_SCRIPT'
-          import struct
-          
-          # 读取原始 boot 镜像
-          with open('original_boot.img', 'rb') as f:
-              data = f.read()
-          
-          original_size = len(data)
-          print(f"原始文件大小: {original_size} 字节")
-          
-          # 构建 DHTB 头 (32字节)
-          # 格式: magic(0x200) + image_size + padding(24字节)
-          header = struct.pack('<II', 0x200, original_size)
-          header += b'\x00' * 24  # 保留字段，全0
-          
-          # 写入签名后的文件
-          output_file = '${{ github.event.inputs.filename }}.img'
-          with open(output_file, 'wb') as f:
-              f.write(header)
-              f.write(data)
-          
-          final_size = len(header) + len(data)
-          print(f"\n=== 签名完成 ===")
-          print(f"DHTB 头大小: {len(header)} 字节")
-          print(f"镜像大小: {original_size} 字节")
-          print(f"最终大小: {final_size} 字节")
-          print(f"输出文件: {output_file}")
-          
-          # 验证 DHTB 头
-          with open(output_file, 'rb') as f:
-              header_check = f.read(32)
-              magic = struct.unpack('<I', header_check[:4])[0]
-              size = struct.unpack('<I', header_check[4:8])[0]
-          
-          print(f"\n=== 验证结果 ===")
-          print(f"Magic: 0x{magic:03x} ({'✓' if magic == 0x200 else '✗'})")
-          print(f"镜像大小: {size} 字节 ({'✓' if size == original_size else '✗'})")
-          PYTHON_SCRIPT
+          wget -O imgheaderinsert.c https://ghproxy.com/https://raw.githubusercontent.com/affggh/sprd-tools/main/imgheaderinsert/imgheaderinsert.c
+          gcc imgheaderinsert.c -o imgheaderinsert
+          chmod +x imgheaderinsert
 
-      - name: 显示最终文件信息
+      - name: 下载boot
         run: |
-          echo ""
-          echo "=== 最终输出 ==="
-          ls -lh ${{ github.event.inputs.filename }}.img
-          
-          echo ""
-          echo "=== DHTB 头详情 (前32字节) ==="
-          xxd ${{ github.event.inputs.filename }}.img | head -3
+          wget -O boot.img "${{ github.event.inputs.boot_url }}"
 
-      - name: 上传签好的 boot
+      - name: 正确签名（展讯UMS312专用）
+        run: |
+          python3 avbtool.py add_hash_footer \
+            --image boot.img \
+            --partition_name boot \
+            --algorithm SHA256_RSA2048 \
+            --key rsa2048.pem \
+            --output boot_signed.img
+
+          ./imgheaderinsert boot_signed.img boot_final.img 0x200
+
+      - name: 上传可直接刷入的镜像
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.inputs.filename }}
-          path: ${{ github.event.inputs.filename }}.img
-          retention-days: 7
+          name: boot_final
+          path: boot_final.img
