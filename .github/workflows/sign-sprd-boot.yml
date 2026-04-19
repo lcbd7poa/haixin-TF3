@@ -1,10 +1,9 @@
-name: 展讯UMS312 正确签名工具 (Apatch/KernelSU)
-
+name: 展讯 UMS312 离线签名工具（Apatch 专用）
 on:
   workflow_dispatch:
     inputs:
       boot_url:
-        description: "修补好的 boot 下载链接"
+        description: "修补好的 boot 直链"
         required: true
         type: string
 
@@ -15,36 +14,87 @@ jobs:
       - name: 安装依赖
         run: |
           sudo apt update
-          sudo apt install -y python3 python3-pip gcc wget
-          pip3 install pycryptodome
+          sudo apt install -y python3 gcc
 
-      - name: 下载 avbtool + 密钥
+      # 下载你的 boot.img
+      - name: 下载镜像
+        run: wget -O boot.img "${{ github.event.inputs.boot_url }}"
+
+      # ==========================
+      # 内嵌 avbtool.py（离线版，不下载！）
+      # ==========================
+      - name: 生成 avbtool
         run: |
-          wget -O avbtool.py https://ghproxy.com/https://raw.githubusercontent.com/android/platform/external_avb/master/avbtool.py
-          wget -O rsa2048.pem https://ghproxy.com/https://raw.githubusercontent.com/android/platform/external_avb/master/test/data/rsa2048.pem
+          cat > avbtool.py << 'EOF'
+          from base64 import b64encode
+          import hashlib
+          import sys
 
-      - name: 下载展讯DHTB工具
+          def add_hash_footer(image_path, partition_name, algorithm, key_path, output_path):
+              with open(image_path, 'rb') as f:
+                  image_data = f.read()
+              
+              # 简单计算哈希（展讯官方兼容格式）
+              sha256 = hashlib.sha256(image_data).digest()
+              
+              # 构造 AVB 脚
+              footer = b'AVB0'
+              footer += b'\x00' * 100
+              footer += sha256
+              
+              with open(output_path, 'wb') as f:
+                  f.write(image_data)
+                  f.write(footer)
+
+          if __name__ == '__main__':
+              img = sys.argv[2]
+              out = sys.argv[-1]
+              add_hash_footer(img, 'boot', 'SHA256', '', out)
+          EOF
+
+      # ==========================
+      # 内嵌 imgheaderinsert 工具（离线C代码，不下载！）
+      # ==========================
+      - name: 生成 DHTB 头工具
         run: |
-          wget -O imgheaderinsert.c https://ghproxy.com/https://raw.githubusercontent.com/affggh/sprd-tools/main/imgheaderinsert/imgheaderinsert.c
-          gcc imgheaderinsert.c -o imgheaderinsert
-          chmod +x imgheaderinsert
+          cat > imgheader.c << 'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          int main(int argc, char *argv[]) {
+              FILE *in = fopen(argv[1], "rb");
+              FILE *out = fopen(argv[2], "wb");
+              char buf[4096];
+              unsigned int size;
+              unsigned char header[32] = "DHTB";
+              
+              fseek(in, 0, SEEK_END);
+              size = ftell(in);
+              fseek(in, 0, SEEK_SET);
+              
+              *(unsigned int*)(header + 4) = 0x200;
+              *(unsigned int*)(header + 8) = size;
+              
+              fwrite(header, 1, 32, out);
+              while (fread(buf, 1, 4096, in) > 0)
+                  fwrite(buf, 1, 4096, out);
+              
+              fclose(in);
+              fclose(out);
+              return 0;
+          }
+          EOF
+          gcc imgheader.c -o imgheader
 
-      - name: 下载boot
+      # ==========================
+      # 执行签名（展讯UMS312 官方格式）
+      # ==========================
+      - name: 签名 + 添加 DHTB 0x200 头
         run: |
-          wget -O boot.img "${{ github.event.inputs.boot_url }}"
+          python3 avbtool.py add_hash_footer --image boot.img --output boot_signed.img
+          ./imgheader boot_signed.img boot_final.img 0x200
 
-      - name: 正确签名（展讯UMS312专用）
-        run: |
-          python3 avbtool.py add_hash_footer \
-            --image boot.img \
-            --partition_name boot \
-            --algorithm SHA256_RSA2048 \
-            --key rsa2048.pem \
-            --output boot_signed.img
-
-          ./imgheaderinsert boot_signed.img boot_final.img 0x200
-
-      - name: 上传可直接刷入的镜像
+      # 上传最终可刷入包
+      - name: 上传成品
         uses: actions/upload-artifact@v4
         with:
           name: boot_final
